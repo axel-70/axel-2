@@ -1,0 +1,448 @@
+name: Build Flash Tools
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create Flash Tools app
+        run: |
+          set -e
+          mkdir -p "$HOME/fa" && cd "$HOME/fa"
+          flutter create --org com.flash --project-name flash_tools --platforms android flash_tools
+          cd flash_tools
+          flutter pub add http:^1.2.2 archive:^3.6.1 file_picker:^8.1.2 flutter_secure_storage:^9.2.2
+          cat > lib/main.dart <<'DART'
+          import 'dart:convert';
+          import 'dart:typed_data';
+          import 'package:archive/archive.dart';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/cupertino.dart';
+          import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+          import 'package:http/http.dart' as http;
+
+          const st = FlutterSecureStorage(aOptions: AndroidOptions(encryptedSharedPreferences: true));
+          const api = 'https://api.github.com';
+          String enc(String p) => p.split('/').map(Uri.encodeComponent).join('/');
+          String j(String d, String n) => d.isEmpty ? n : '$d/$n';
+
+          class Gh {
+            final String t;
+            Gh(this.t);
+            Map<String, String> hd([String a = 'application/vnd.github+json']) =>
+                {'Authorization': 'Bearer $t', 'Accept': a, 'Content-Type': 'application/json'};
+            Future<dynamic> get(String p) async {
+              final r = await http.get(Uri.parse('$api$p'), headers: hd());
+              if (r.statusCode >= 300) throw jsonDecode(r.body)['message'] ?? r.statusCode;
+              return jsonDecode(utf8.decode(r.bodyBytes));
+            }
+            Future<Uint8List> raw(String repo, String p) async {
+              final r = await http.get(Uri.parse('$api/repos/$repo/contents/${enc(p)}'),
+                  headers: hd('application/vnd.github.raw+json'));
+              if (r.statusCode >= 300) throw 'فشل تحميل $p';
+              return r.bodyBytes;
+            }
+            Future<void> up(String repo, String p, List<int> b) async {
+              final u = Uri.parse('$api/repos/$repo/contents/${enc(p)}');
+              String? sha;
+              final r0 = await http.get(u, headers: hd());
+              if (r0.statusCode == 200) {
+                final d = jsonDecode(r0.body);
+                if (d is Map) sha = d['sha'];
+              }
+              final r = await http.put(u,
+                  headers: hd(),
+                  body: jsonEncode({'message': 'Flash Tools', 'content': base64Encode(b), if (sha != null) 'sha': sha}));
+              if (r.statusCode >= 300) throw jsonDecode(r.body)['message'] ?? 'فشل الرفع';
+            }
+            Future<void> del(String repo, String p, String sha) async {
+              final r = await http.delete(Uri.parse('$api/repos/$repo/contents/${enc(p)}'),
+                  headers: hd(), body: jsonEncode({'message': 'Flash Tools', 'sha': sha}));
+              if (r.statusCode >= 300) throw 'فشل حذف $p';
+            }
+          }
+
+          void main() => runApp(CupertinoApp(
+                debugShowCheckedModeBanner: false,
+                title: 'Flash Tools',
+                theme: const CupertinoThemeData(
+                    primaryColor: CupertinoColors.systemBlue, scaffoldBackgroundColor: Color(0xFFF2F2F7)),
+                builder: (c, w) => Directionality(textDirection: TextDirection.rtl, child: w!),
+                home: const Root(),
+              ));
+
+          void alert(BuildContext c, String s) => showCupertinoDialog(
+              context: c,
+              builder: (x) => CupertinoAlertDialog(
+                  content: Text(s),
+                  actions: [CupertinoDialogAction(child: const Text('حسناً'), onPressed: () => Navigator.pop(x))]));
+
+          class Root extends StatefulWidget {
+            const Root({super.key});
+            @override
+            State<Root> createState() => _Root();
+          }
+
+          class _Root extends State<Root> {
+            Gh? g;
+            bool ready = false;
+            @override
+            void initState() {
+              super.initState();
+              st.read(key: 'tk').then((t) {
+                if (mounted) setState(() { g = t == null ? null : Gh(t); ready = true; });
+              });
+            }
+            @override
+            Widget build(BuildContext c) => !ready
+                ? const CupertinoPageScaffold(child: Center(child: CupertinoActivityIndicator()))
+                : g == null
+                    ? Login((t) => setState(() => g = Gh(t)))
+                    : Repos(g!, () async { await st.delete(key: 'tk'); setState(() => g = null); });
+          }
+
+          class Login extends StatefulWidget {
+            final void Function(String) ok;
+            const Login(this.ok, {super.key});
+            @override
+            State<Login> createState() => _Login();
+          }
+
+          class _Login extends State<Login> {
+            final c = TextEditingController();
+            String? err;
+            bool busy = false;
+            Future<void> go() async {
+              final t = c.text.trim();
+              if (t.isEmpty) return;
+              setState(() { busy = true; err = null; });
+              try {
+                final r = await http.get(Uri.parse('$api/user'), headers: {'Authorization': 'Bearer $t'});
+                if (r.statusCode != 200) throw 'التوكن غير صحيح';
+                await st.write(key: 'tk', value: t);
+                widget.ok(t);
+              } catch (e) {
+                if (mounted) setState(() { err = '$e'; busy = false; });
+              }
+            }
+            @override
+            Widget build(BuildContext x) => CupertinoPageScaffold(
+                  child: SafeArea(
+                    child: Center(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.all(28),
+                        child: Column(children: [
+                          Container(
+                            width: 104, height: 104,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(24),
+                              gradient: const LinearGradient(colors: [Color(0xFF0A84FF), Color(0xFFBF5AF2)]),
+                              boxShadow: const [BoxShadow(color: Color(0x550A84FF), blurRadius: 28, offset: Offset(0, 12))],
+                            ),
+                            child: const Icon(CupertinoIcons.bolt_fill, color: CupertinoColors.white, size: 56),
+                          ),
+                          const SizedBox(height: 22),
+                          const Text('Flash Tools', style: TextStyle(fontSize: 32, fontWeight: FontWeight.w700)),
+                          const SizedBox(height: 6),
+                          const Text('أدوات قوية لإدارة ملفات حسابك على GitHub',
+                              textAlign: TextAlign.center, style: TextStyle(color: CupertinoColors.systemGrey)),
+                          const SizedBox(height: 30),
+                          CupertinoTextField(
+                            controller: c, obscureText: true, textDirection: TextDirection.ltr,
+                            placeholder: 'ضع توكن GitHub هنا', padding: const EdgeInsets.all(16),
+                            decoration: BoxDecoration(color: CupertinoColors.white, borderRadius: BorderRadius.circular(14)),
+                          ),
+                          if (err != null)
+                            Padding(padding: const EdgeInsets.only(top: 10),
+                                child: Text(err!, style: const TextStyle(color: CupertinoColors.systemRed))),
+                          const SizedBox(height: 18),
+                          SizedBox(
+                            width: double.infinity,
+                            child: CupertinoButton.filled(
+                                borderRadius: BorderRadius.circular(14),
+                                onPressed: busy ? null : go,
+                                child: busy ? const CupertinoActivityIndicator() : const Text('دخول')),
+                          ),
+                          const SizedBox(height: 14),
+                          const Text('🔒 التوكن بيتخزن مشفّر على جهازك فقط',
+                              style: TextStyle(fontSize: 12, color: CupertinoColors.systemGrey)),
+                        ]),
+                      ),
+                    ),
+                  ),
+                );
+          }
+
+          class Repos extends StatefulWidget {
+            final Gh g;
+            final VoidCallback out;
+            const Repos(this.g, this.out, {super.key});
+            @override
+            State<Repos> createState() => _Repos();
+          }
+
+          class _Repos extends State<Repos> {
+            List? l;
+            String? e;
+            @override
+            void initState() {
+              super.initState();
+              widget.g.get('/user/repos?per_page=100&sort=updated').then((v) {
+                if (mounted) setState(() => l = v);
+              }).catchError((x) {
+                if (mounted) setState(() => e = '$x');
+              });
+            }
+            @override
+            Widget build(BuildContext c) => CupertinoPageScaffold(
+                  navigationBar: CupertinoNavigationBar(
+                    middle: const Text('مستودعاتي'),
+                    leading: CupertinoButton(
+                        padding: EdgeInsets.zero, onPressed: widget.out,
+                        child: const Text('خروج', style: TextStyle(color: CupertinoColors.systemRed))),
+                  ),
+                  child: SafeArea(
+                    child: e != null
+                        ? Center(child: Text(e!))
+                        : l == null
+                            ? const Center(child: CupertinoActivityIndicator())
+                            : ListView(children: [
+                                CupertinoListSection.insetGrouped(
+                                  children: l!.map<Widget>((r) => CupertinoListTile(
+                                        leading: Icon(r['private'] == true ? CupertinoIcons.lock_fill : CupertinoIcons.book_fill,
+                                            color: CupertinoColors.systemBlue),
+                                        title: Text(r['name']),
+                                        subtitle: Text(r['private'] == true ? 'خاص' : 'عام'),
+                                        trailing: const Icon(CupertinoIcons.chevron_back, size: 18),
+                                        onTap: () => Navigator.push(c, CupertinoPageRoute(builder: (_) => Br(widget.g, r['full_name'], ''))),
+                                      )).toList(),
+                                ),
+                              ]),
+                  ),
+                );
+          }
+
+          class Br extends StatefulWidget {
+            final Gh g;
+            final String repo, path;
+            const Br(this.g, this.repo, this.path, {super.key});
+            @override
+            State<Br> createState() => _Br();
+          }
+
+          class _Br extends State<Br> {
+            List items = [];
+            Set<String> sel = {};
+            bool busy = true;
+            String? job;
+            @override
+            void initState() { super.initState(); load(); }
+            List<Map> get files => items.where((i) => sel.contains(i['path'])).cast<Map>().toList();
+
+            Future<void> load() async {
+              setState(() { busy = true; sel = {}; });
+              try {
+                final d = await widget.g.get('/repos/${widget.repo}/contents/${enc(widget.path)}');
+                items = (d as List).toList()..sort((a, b) => (a['type'] == 'dir' ? 0 : 1).compareTo(b['type'] == 'dir' ? 0 : 1));
+              } catch (e) {
+                if (mounted) alert(context, '$e');
+              }
+              if (mounted) setState(() => busy = false);
+            }
+
+            Future<void> run(String label, Future<void> Function() f) async {
+              setState(() { busy = true; job = label; });
+              try { await f(); } catch (e) { if (mounted) alert(context, 'خطأ: $e'); }
+              await load();
+              if (mounted) setState(() => job = null);
+            }
+
+            Future<void> extract(List<int> b) async {
+              for (final f in ZipDecoder().decodeBytes(b)) {
+                if (f.isFile) await widget.g.up(widget.repo, j(widget.path, f.name), f.content as List<int>);
+              }
+            }
+
+            Future<Uint8List> pack() async {
+              final a = Archive();
+              for (final f in files) {
+                final b = await widget.g.raw(widget.repo, f['path']);
+                a.addFile(ArchiveFile(f['name'] as String, b.length, b));
+              }
+              return Uint8List.fromList(ZipEncoder().encode(a)!);
+            }
+
+            Future<void> pick(bool z) async {
+              final r = await FilePicker.platform.pickFiles(allowMultiple: !z, withData: true);
+              if (r == null) return;
+              run('جاري الرفع...', () async {
+                for (final f in r.files) {
+                  z ? await extract(f.bytes!) : await widget.g.up(widget.repo, j(widget.path, f.name), f.bytes!);
+                }
+              });
+            }
+
+            void upMenu() => showCupertinoModalPopup(
+                context: context,
+                builder: (x) => CupertinoActionSheet(
+                      actions: [
+                        CupertinoActionSheetAction(onPressed: () { Navigator.pop(x); pick(false); }, child: const Text('رفع ملفات')),
+                        CupertinoActionSheetAction(onPressed: () { Navigator.pop(x); pick(true); }, child: const Text('رفع ملف zip وفك ضغطه')),
+                      ],
+                      cancelButton: CupertinoActionSheetAction(onPressed: () => Navigator.pop(x), child: const Text('إلغاء')),
+                    ));
+
+            void delSel() => showCupertinoDialog(
+                context: context,
+                builder: (x) => CupertinoAlertDialog(
+                      title: Text('حذف ${sel.length} ملف؟'),
+                      content: const Text('لا يمكن التراجع عن الحذف'),
+                      actions: [
+                        CupertinoDialogAction(onPressed: () => Navigator.pop(x), child: const Text('إلغاء')),
+                        CupertinoDialogAction(
+                            isDestructiveAction: true,
+                            onPressed: () {
+                              Navigator.pop(x);
+                              run('جاري الحذف...', () async {
+                                for (final f in files) { await widget.g.del(widget.repo, f['path'], f['sha']); }
+                              });
+                            },
+                            child: const Text('حذف')),
+                      ],
+                    ));
+
+            Widget tile(Map i) {
+              final d = i['type'] == 'dir';
+              final p = i['path'] as String;
+              final s = sel.contains(p);
+              return CupertinoListTile(
+                leading: Icon(d ? CupertinoIcons.folder_fill : CupertinoIcons.doc_fill,
+                    color: d ? CupertinoColors.systemYellow : CupertinoColors.systemBlue),
+                title: Text(i['name']),
+                trailing: d
+                    ? const Icon(CupertinoIcons.chevron_back, size: 18)
+                    : Icon(s ? CupertinoIcons.checkmark_circle_fill : CupertinoIcons.circle,
+                        color: s ? CupertinoColors.systemBlue : CupertinoColors.systemGrey3),
+                onTap: () => d
+                    ? Navigator.push(context, CupertinoPageRoute(builder: (_) => Br(widget.g, widget.repo, p)))
+                    : setState(() => s ? sel.remove(p) : sel.add(p)),
+              );
+            }
+
+            Widget bar() {
+              final n = sel.length;
+              final z1 = n == 1 && (files.first['name'] as String).toLowerCase().endsWith('.zip');
+              Widget b(IconData i, String t, VoidCallback? f, [Color? col]) => Expanded(
+                  child: CupertinoButton(
+                      padding: const EdgeInsets.symmetric(vertical: 6),
+                      onPressed: busy ? null : f,
+                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(i, size: 24, color: (busy || f == null) ? null : col),
+                        const SizedBox(height: 2),
+                        Text(t, style: const TextStyle(fontSize: 11)),
+                      ])));
+              return Container(
+                decoration: const BoxDecoration(color: Color(0xFFFFFFFF), border: Border(top: BorderSide(color: Color(0x1F000000)))),
+                child: SafeArea(
+                  top: false,
+                  child: Row(children: [
+                    b(CupertinoIcons.cloud_upload, 'رفع', upMenu),
+                    b(CupertinoIcons.folder_open, 'فك ضغط', z1 ? () => run('جاري فك الضغط...', () async => extract(await widget.g.raw(widget.repo, files.first['path']))) : null),
+                    b(CupertinoIcons.archivebox, 'ضغط', n > 0 ? () => run('جاري الضغط...', () async => widget.g.up(widget.repo, j(widget.path, 'Archive_${DateTime.now().millisecondsSinceEpoch}.zip'), await pack())) : null),
+                    b(CupertinoIcons.cloud_download, 'تحميل', n > 0 ? () => run('جاري التحميل...', () async {
+                      final one = n == 1;
+                      final bytes = one ? await widget.g.raw(widget.repo, files.first['path']) : await pack();
+                      await FilePicker.platform.saveFile(fileName: one ? files.first['name'] : 'FlashTools.zip', bytes: bytes);
+                    }) : null),
+                    b(CupertinoIcons.trash, 'حذف', n > 0 ? delSel : null, CupertinoColors.systemRed),
+                  ]),
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext c) => CupertinoPageScaffold(
+                  navigationBar: CupertinoNavigationBar(
+                    middle: Text(widget.path.isEmpty ? widget.repo.split('/').last : widget.path.split('/').last),
+                    trailing: CupertinoButton(padding: EdgeInsets.zero, onPressed: busy ? null : load, child: const Icon(CupertinoIcons.refresh)),
+                  ),
+                  child: SafeArea(
+                    bottom: false,
+                    child: Column(children: [
+                      Expanded(
+                        child: busy
+                            ? Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                                const CupertinoActivityIndicator(radius: 14),
+                                if (job != null) Padding(padding: const EdgeInsets.only(top: 12), child: Text(job!)),
+                              ]))
+                            : items.isEmpty
+                                ? const Center(child: Text('المجلد فاضي', style: TextStyle(color: CupertinoColors.systemGrey)))
+                                : ListView(children: [CupertinoListSection.insetGrouped(children: items.map<Widget>((i) => tile(i)).toList())]),
+                      ),
+                      bar(),
+                    ]),
+                  ),
+                );
+          }
+          DART
+          # app name + internet permission + min SDK
+          sed -i 's/android:label="[^"]*"/android:label="Flash Tools"/' android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/; s/minSdkVersion flutter.minSdkVersion/minSdkVersion 23/' android/app/build.gradle*
+          # app icon
+          python3 -m pip install --break-system-packages pillow || sudo apt-get install -y python3-pil
+          cat > icon.py <<'PY'
+          from PIL import Image, ImageDraw
+          S = 1024
+          img = Image.new('RGB', (S, S))
+          px = img.load()
+          for y in range(S):
+              for x in range(S):
+                  t = (x + y) / (2 * S)
+                  px[x, y] = (int(10 + 179 * t), int(132 - 42 * t), int(255 - 13 * t))
+          d = ImageDraw.Draw(img)
+          pts = [(.60,.10),(.27,.55),(.47,.55),(.40,.90),(.75,.43),(.54,.43),(.66,.10)]
+          d.polygon([(x * S, y * S) for x, y in pts], fill=(255, 255, 255))
+          import os
+          base = 'android/app/src/main/res'
+          for n, s in {'mdpi':48,'hdpi':72,'xhdpi':96,'xxhdpi':144,'xxxhdpi':192}.items():
+              os.makedirs(f'{base}/mipmap-{n}', exist_ok=True)
+              img.resize((s, s), Image.LANCZOS).save(f'{base}/mipmap-{n}/ic_launcher.png')
+          PY
+          python3 icon.py
+
+      - name: Build APK
+        run: cd "$HOME/fa/flash_tools" && flutter build apk --release
+
+      - name: Collect APK
+        run: cp "$HOME/fa/flash_tools/build/app/outputs/flutter-apk/app-release.apk" FlashTools.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FlashTools-apk
+          path: FlashTools.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Flash Tools v${{ github.run_number }}
+          files: FlashTools.apk
