@@ -14,6 +14,8 @@ import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.OpenableColumns;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
@@ -21,12 +23,14 @@ import android.text.InputType;
 import android.text.TextUtils;
 import android.util.Base64;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -42,9 +46,12 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -62,10 +69,17 @@ import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
 public class MainActivity extends Activity {
-    static final String BG = "#F2F2F7", BLUE = "#007AFF", RED = "#FF3B30", GRAY = "#8E8E93";
+    static final String GRAY = "#8E8E93", GOLD = "#FFD479", SOFT = "#E6DDFF";
     static final String API = "https://api.github.com";
     static final String JSON = "application/vnd.github+json";
     static final String RAW = "application/vnd.github.raw+json";
+    static final String[][] CARDS = {
+            {"🔑", "ادخل بالتوكن", "حط توكن GitHub مرة واحدة. بيتخزن مشفّر على جهازك ومحدش يقدر ياخده."},
+            {"☰", "افتح القائمة الجانبية", "هتلاقي مستودعاتك متقسمة: حسابك لوحده وكل فريق انت عضو فيه لوحده."},
+            {"📂", "ادخل أي مستودع", "تصفّح الملفات والمجلدات، وحدد اللي عايزه بضغطة على الدايرة."},
+            {"🛠️", "أدوات قوية", "رفع ملفات، فك ضغط zip، ضغط، تحميل، وحذف مجلدات كاملة."},
+            {"🛡️", "على حسب صلاحيات التوكن", "الأدوات بتتفعّل حسب صلاحيتك على كل مستودع: مدير، كتابة، أو قراءة فقط."}
+    };
 
     interface Task { void run() throws Exception; }
 
@@ -74,16 +88,40 @@ public class MainActivity extends Activity {
         HttpEx(int c, String m) { super(m); code = c; }
     }
 
-    FrameLayout host, overlay, barBox;
-    TextView overlayText;
+    String BG, CARD, TXT, SEP, BLUE, RED;
+    boolean dark;
+    FrameLayout host, overlay, barBox, drawer;
+    LinearLayout panel, cardView, dotsBox;
+    View scrim;
+    TextView overlayText, clockT, clockD;
     final ExecutorService ex = Executors.newSingleThreadExecutor();
+    final Handler hnd = new Handler(Looper.getMainLooper());
     SharedPreferences prefs;
-    String token, repo = "", path = "";
+    String token, repo = "", path = "", branch = "main", me = "";
+    volatile String scopes, lastScopes;
     List<JSONObject> items = new ArrayList<>();
+    List<JSONObject> repos = new ArrayList<>();
+    JSONObject cur;
     final Set<String> sel = new LinkedHashSet<>();
-    int screen = 0;
-    boolean busy = false;
+    final Set<String> openGroups = new HashSet<>();
+    int screen = 0, cardIdx = 0, panelW;
+    boolean busy = false, loaded = false, canWrite = false, drawerOpen = false, gInit = false;
     byte[] pendingSave;
+    final SimpleDateFormat tf = new SimpleDateFormat("hh:mm:ss a", Locale.forLanguageTag("ar"));
+    final SimpleDateFormat df = new SimpleDateFormat("EEEE d MMMM", Locale.forLanguageTag("ar"));
+
+    final Runnable tick = new Runnable() {
+        @Override public void run() {
+            if (screen == 1 && clockT != null) updateClock();
+            hnd.postDelayed(this, 1000);
+        }
+    };
+    final Runnable adv = new Runnable() {
+        @Override public void run() {
+            if (screen == 1 && cardView != null && !drawerOpen && !busy) flip(cardIdx + 1);
+            hnd.postDelayed(this, 4500);
+        }
+    };
 
     // ---------- helpers ----------
     int dp(float v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
@@ -92,6 +130,14 @@ public class MainActivity extends Activity {
         GradientDrawable g = new GradientDrawable();
         g.setColor(Color.parseColor(c));
         g.setCornerRadius(dp(r));
+        return g;
+    }
+
+    GradientDrawable legend(int r) {
+        GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                new int[]{0xFF1E1147, 0xFF4B2A8A, 0xFF2A0F5C});
+        g.setCornerRadius(dp(r));
+        g.setStroke(dp(2), 0x99FFD479);
         return g;
     }
 
@@ -110,22 +156,36 @@ public class MainActivity extends Activity {
         return l;
     }
 
+    LinearLayout hrow(View... vs) {
+        LinearLayout l = new LinearLayout(this);
+        l.setGravity(Gravity.CENTER_VERTICAL);
+        for (View v : vs) l.addView(v);
+        return l;
+    }
+
     LinearLayout.LayoutParams lp(int w, int h) { return new LinearLayout.LayoutParams(w, h); }
+
+    View gap(int d) {
+        View v = new View(this);
+        v.setLayoutParams(lp(1, dp(d)));
+        return v;
+    }
 
     void ui(Runnable r) { runOnUiThread(r); }
     void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
     String err(Exception e) { return e.getMessage() == null ? e.toString() : e.getMessage(); }
 
-    void alert(String t, String m) {
-        new AlertDialog.Builder(this).setTitle(t).setMessage(m).setPositiveButton("حسناً", null).show();
+    AlertDialog.Builder ab() {
+        return new AlertDialog.Builder(this, dark ? AlertDialog.THEME_DEVICE_DEFAULT_DARK : AlertDialog.THEME_DEVICE_DEFAULT_LIGHT);
     }
 
+    void alert(String t, String m) { ab().setTitle(t).setMessage(m).setPositiveButton("حسناً", null).show(); }
     void busy(String m) { busy = true; overlayText.setText(m); overlay.setVisibility(View.VISIBLE); }
     void idle() { busy = false; overlay.setVisibility(View.GONE); }
     void status(String s) { ui(() -> overlayText.setText(s)); }
 
     View ripple(View v) {
-        v.setBackground(new RippleDrawable(ColorStateList.valueOf(0x22000000), null, new ColorDrawable(Color.BLACK)));
+        v.setBackground(new RippleDrawable(ColorStateList.valueOf(0x22888888), null, new ColorDrawable(Color.BLACK)));
         return v;
     }
 
@@ -137,15 +197,21 @@ public class MainActivity extends Activity {
         return t;
     }
 
+    TextView menuBtn() {
+        TextView t = link("☰", BLUE, v -> openDrawer());
+        t.setTextSize(26);
+        return t;
+    }
+
     View row(String icon, String title, String sub, View trail, View.OnClickListener l) {
         LinearLayout r = new LinearLayout(this);
         r.setGravity(Gravity.CENTER_VERTICAL);
         r.setPadding(dp(16), dp(12), dp(16), dp(12));
-        TextView ic = tv(icon, 22, "#000000", false);
+        TextView ic = tv(icon, 22, TXT, false);
         ic.setPaddingRelative(0, 0, dp(12), 0);
         r.addView(ic);
         LinearLayout m = vbox();
-        TextView t = tv(title, 16, "#000000", false);
+        TextView t = tv(title, 16, TXT, false);
         t.setMaxLines(1);
         t.setEllipsize(TextUtils.TruncateAt.MIDDLE);
         m.addView(t);
@@ -159,12 +225,12 @@ public class MainActivity extends Activity {
 
     LinearLayout card(List<View> rows) {
         LinearLayout c = vbox();
-        c.setBackground(rect("#FFFFFF", 14));
+        c.setBackground(rect(CARD, 14));
         c.setClipToOutline(true);
         for (int i = 0; i < rows.size(); i++) {
             if (i > 0) {
                 View d = new View(this);
-                d.setBackgroundColor(0x1F000000);
+                d.setBackgroundColor(Color.parseColor(SEP));
                 LinearLayout.LayoutParams p = lp(-1, 1);
                 p.setMarginStart(dp(50));
                 c.addView(d, p);
@@ -174,16 +240,16 @@ public class MainActivity extends Activity {
         return c;
     }
 
-    LinearLayout page(String title, View back, View end, View content, View bottom) {
+    LinearLayout page(String title, View start, View end, View content, View bottom) {
         LinearLayout root = vbox();
         LinearLayout top = new LinearLayout(this);
         top.setGravity(Gravity.CENTER_VERTICAL);
         top.setPadding(dp(12), dp(8), dp(12), 0);
-        if (back != null) top.addView(back);
+        if (start != null) top.addView(start);
         top.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
         if (end != null) top.addView(end);
         root.addView(top);
-        TextView t = tv(title, 30, "#000000", true);
+        TextView t = tv(title, 30, TXT, true);
         t.setPadding(dp(20), dp(2), dp(20), dp(8));
         t.setMaxLines(1);
         t.setEllipsize(TextUtils.TruncateAt.END);
@@ -201,7 +267,24 @@ public class MainActivity extends Activity {
     void setScreen(View v) {
         host.removeAllViews();
         host.addView(v, new FrameLayout.LayoutParams(-1, -1));
+        host.addView(drawer, new FrameLayout.LayoutParams(-1, -1));
         host.addView(overlay, new FrameLayout.LayoutParams(-1, -1));
+    }
+
+    void applyTheme() {
+        dark = prefs.getBoolean("dark", false);
+        BG = dark ? "#000000" : "#F2F2F7";
+        CARD = dark ? "#1C1C1E" : "#FFFFFF";
+        TXT = dark ? "#FFFFFF" : "#000000";
+        SEP = dark ? "#38383A" : "#D1D1D6";
+        BLUE = dark ? "#0A84FF" : "#007AFF";
+        RED = dark ? "#FF453A" : "#FF3B30";
+        getWindow().setStatusBarColor(Color.parseColor(BG));
+        getWindow().setNavigationBarColor(Color.parseColor(CARD));
+        getWindow().getDecorView().setSystemUiVisibility(dark ? 0
+                : (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR));
+        host.setBackgroundColor(Color.parseColor(BG));
+        overlay.setBackgroundColor(dark ? 0xCC000000 : 0xCCF2F2F7);
     }
 
     // ---------- lifecycle ----------
@@ -209,15 +292,9 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         prefs = getSharedPreferences("ft", MODE_PRIVATE);
-        getWindow().setStatusBarColor(Color.parseColor(BG));
-        getWindow().setNavigationBarColor(Color.WHITE);
-        getWindow().getDecorView().setSystemUiVisibility(
-                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         host = new FrameLayout(this);
-        host.setBackgroundColor(Color.parseColor(BG));
         host.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
         overlay = new FrameLayout(this);
-        overlay.setBackgroundColor(0xCCF2F2F7);
         overlay.setClickable(true);
         overlay.setVisibility(View.GONE);
         LinearLayout ob = vbox();
@@ -228,27 +305,40 @@ public class MainActivity extends Activity {
         overlayText.setPadding(dp(20), dp(10), dp(20), 0);
         ob.addView(overlayText);
         overlay.addView(ob, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        drawer = new FrameLayout(this);
+        drawer.setVisibility(View.GONE);
+        scrim = new View(this);
+        scrim.setBackgroundColor(0x99000000);
+        scrim.setOnClickListener(v -> closeDrawer());
+        drawer.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
+        panel = vbox();
+        panelW = Math.min(dp(330), (int) (getResources().getDisplayMetrics().widthPixels * 0.86f));
+        drawer.addView(panel, new FrameLayout.LayoutParams(panelW, -1, Gravity.START));
+        applyTheme();
         setContentView(host);
         token = loadToken();
-        if (token == null) showLogin(); else showRepos();
+        if (token == null) showLogin(); else showHome();
+        hnd.post(tick);
+        hnd.postDelayed(adv, 4500);
     }
 
     @Override
     public void onBackPressed() {
         if (busy) return;
+        if (drawerOpen) { closeDrawer(); return; }
         if (screen == 2) goBack(); else super.onBackPressed();
     }
 
     void goBack() {
         if (busy) return;
-        if (path.isEmpty()) { showRepos(); return; }
+        if (path.isEmpty()) { showHome(); return; }
         int i = path.lastIndexOf('/');
         path = i < 0 ? "" : path.substring(0, i);
         sel.clear();
         work("جاري التحميل...", null);
     }
 
-    // ---------- screens ----------
+    // ---------- login / account ----------
     void showLogin() {
         screen = 0;
         LinearLayout c = vbox();
@@ -262,7 +352,7 @@ public class MainActivity extends Activity {
         logo.setBackground(g);
         logo.setElevation(dp(10));
         c.addView(logo, lp(dp(104), dp(104)));
-        TextView h = tv("Flash Tools", 32, "#000000", true);
+        TextView h = tv("Flash Tools", 32, TXT, true);
         h.setPadding(0, dp(22), 0, dp(6));
         c.addView(h);
         TextView s = tv("أدوات قوية لإدارة ملفات حسابك على GitHub", 15, GRAY, false);
@@ -270,9 +360,11 @@ public class MainActivity extends Activity {
         c.addView(s);
         final EditText et = new EditText(this);
         et.setHint("ضع توكن GitHub هنا");
+        et.setHintTextColor(Color.parseColor(GRAY));
+        et.setTextColor(Color.parseColor(TXT));
         et.setSingleLine();
         et.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        et.setBackground(rect("#FFFFFF", 14));
+        et.setBackground(rect(CARD, 14));
         et.setPadding(dp(16), dp(14), dp(16), dp(14));
         LinearLayout.LayoutParams ep = lp(-1, -2);
         ep.topMargin = dp(30);
@@ -290,7 +382,7 @@ public class MainActivity extends Activity {
                     token = t;
                     req("GET", API + "/user", JSON, null);
                     saveToken(t);
-                    ui(() -> { idle(); showRepos(); });
+                    ui(() -> { idle(); showHome(); });
                 } catch (Exception e) {
                     token = null;
                     ui(() -> { idle(); alert("فشل الدخول", err(e)); });
@@ -310,43 +402,301 @@ public class MainActivity extends Activity {
 
     void logout() {
         prefs.edit().remove("t").apply();
-        token = null;
+        token = null; me = ""; cur = null; loaded = false;
+        repos = new ArrayList<>();
+        closeDrawer();
         showLogin();
     }
 
-    void showRepos() {
-        screen = 1;
-        repo = "";
-        path = "";
-        setScreen(page("مستودعاتي", null, link("خروج", RED, v -> logout()), vbox(), null));
-        busy("جاري تحميل المستودعات...");
+    void loadAccount() {
+        busy("جاري تحميل حسابك...");
         ex.execute(() -> {
             try {
-                final JSONArray a = new JSONArray(str(req("GET", API + "/user/repos?per_page=100&sort=updated", JSON, null)));
+                JSONObject u = new JSONObject(str(req("GET", API + "/user", JSON, null)));
+                me = u.optString("login");
+                scopes = lastScopes;
+                List<JSONObject> all = new ArrayList<>();
+                for (int pg = 1; pg <= 5; pg++) {
+                    JSONArray a = new JSONArray(str(req("GET", API + "/user/repos?per_page=100&page=" + pg
+                            + "&sort=updated&affiliation=owner,collaborator,organization_member", JSON, null)));
+                    for (int i = 0; i < a.length(); i++) all.add(a.getJSONObject(i));
+                    if (a.length() < 100) break;
+                }
+                repos = all;
+                loaded = true;
+                ui(() -> { idle(); if (screen == 1) render(); });
+            } catch (Exception e) {
                 ui(() -> {
                     idle();
-                    List<View> rows = new ArrayList<>();
-                    for (int i = 0; i < a.length(); i++) {
-                        JSONObject o = a.optJSONObject(i);
-                        if (o == null) continue;
-                        final String full = o.optString("full_name");
-                        boolean pr = o.optBoolean("private");
-                        rows.add(row(pr ? "🔒" : "📘", o.optString("name"), pr ? "خاص" : "عام",
-                                tv("‹", 24, GRAY, false), v -> { repo = full; path = ""; showBrowser(); }));
-                    }
-                    LinearLayout content = vbox();
-                    if (rows.isEmpty()) content.addView(tv("مفيش مستودعات", 16, GRAY, false));
-                    else content.addView(card(rows));
-                    setScreen(page("مستودعاتي", null, link("خروج", RED, v -> logout()), content, null));
+                    if (e instanceof HttpEx && ((HttpEx) e).code == 401) logout();
+                    else alert("خطأ", err(e));
                 });
-            } catch (Exception e) {
-                ui(() -> { idle(); alert("خطأ", err(e)); });
             }
         });
     }
 
+    // ---------- home ----------
+    void showHome() {
+        screen = 1;
+        render();
+        if (!loaded) loadAccount();
+    }
+
+    void render() {
+        if (screen == 1) homeUI();
+        else if (screen == 2) renderBrowser();
+    }
+
+    void updateClock() {
+        Date d = new Date();
+        clockT.setText("⚜ " + tf.format(d));
+        clockD.setText(df.format(d));
+    }
+
+    void homeUI() {
+        LinearLayout c = vbox();
+        LinearLayout cl = new LinearLayout(this);
+        cl.setGravity(Gravity.CENTER_VERTICAL);
+        cl.setPadding(dp(18), dp(12), dp(18), dp(12));
+        cl.setBackground(legend(20));
+        clockT = tv("", 22, GOLD, true);
+        clockD = tv("", 12, SOFT, false);
+        cl.addView(clockT, new LinearLayout.LayoutParams(0, -2, 1));
+        cl.addView(clockD);
+        c.addView(cl);
+        updateClock();
+        c.addView(gap(16));
+        cardView = vbox();
+        cardView.setGravity(Gravity.CENTER);
+        cardView.setPadding(dp(24), dp(24), dp(24), dp(24));
+        cardView.setMinimumHeight(dp(300));
+        cardView.setBackground(legend(28));
+        cardView.setElevation(dp(12));
+        cardView.setCameraDistance(getResources().getDisplayMetrics().density * 8000);
+        fillCard(cardView, cardIdx);
+        cardView.setOnTouchListener(new View.OnTouchListener() {
+            float x0;
+            @Override public boolean onTouch(View v, MotionEvent m) {
+                if (m.getAction() == MotionEvent.ACTION_DOWN) { x0 = m.getX(); return true; }
+                if (m.getAction() == MotionEvent.ACTION_UP) {
+                    float dx = m.getX() - x0;
+                    hnd.removeCallbacks(adv);
+                    hnd.postDelayed(adv, 6000);
+                    flip(dx > 120 ? cardIdx - 1 : cardIdx + 1);
+                }
+                return true;
+            }
+        });
+        c.addView(cardView, lp(-1, -2));
+        dotsBox = new LinearLayout(this);
+        dotsBox.setGravity(Gravity.CENTER);
+        dotsBox.setPadding(0, dp(16), 0, dp(8));
+        paintDots();
+        c.addView(dotsBox, lp(-1, -2));
+        TextView info = tv(loaded ? repos.size() + " مستودع متاح لتوكنك — افتح القائمة ☰ واختار مستودع"
+                : "جاري تحميل حسابك...", 13, GRAY, false);
+        info.setGravity(Gravity.CENTER);
+        info.setPadding(0, dp(6), 0, dp(14));
+        c.addView(info, lp(-1, -2));
+        TextView dev = tv("تطوير AXEL ⚡", 12, GRAY, true);
+        dev.setGravity(Gravity.CENTER);
+        c.addView(dev, lp(-1, -2));
+        setScreen(page("Flash Tools", hrow(menuBtn()), null, c, null));
+    }
+
+    void fillCard(LinearLayout cv, int i) {
+        cv.removeAllViews();
+        String[] d = CARDS[i];
+        TextView st = tv((i + 1) + " / " + CARDS.length, 12, GOLD, false);
+        st.setGravity(Gravity.CENTER);
+        TextView em = tv(d[0], 64, "#FFFFFF", false);
+        em.setGravity(Gravity.CENTER);
+        em.setPadding(0, dp(18), 0, dp(14));
+        TextView t = tv(d[1], 24, GOLD, true);
+        t.setGravity(Gravity.CENTER);
+        TextView b = tv(d[2], 16, SOFT, false);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(0, dp(12), 0, 0);
+        b.setLineSpacing(0, 1.25f);
+        cv.addView(st, lp(-1, -2));
+        cv.addView(em, lp(-1, -2));
+        cv.addView(t, lp(-1, -2));
+        cv.addView(b, lp(-1, -2));
+    }
+
+    void flip(int n) {
+        if (cardView == null) return;
+        final LinearLayout cv = cardView;
+        cardIdx = (n + CARDS.length) % CARDS.length;
+        paintDots();
+        cv.animate().rotationY(90).alpha(0.2f).setDuration(220).withEndAction(() -> {
+            fillCard(cv, cardIdx);
+            cv.setRotationY(-90);
+            cv.animate().rotationY(0).alpha(1f).setDuration(260).start();
+        }).start();
+    }
+
+    void paintDots() {
+        if (dotsBox == null) return;
+        dotsBox.removeAllViews();
+        for (int i = 0; i < CARDS.length; i++) {
+            View d = new View(this);
+            d.setBackground(rect(i == cardIdx ? GOLD : GRAY, 4));
+            LinearLayout.LayoutParams p = lp(dp(i == cardIdx ? 20 : 7), dp(7));
+            p.setMargins(dp(3), 0, dp(3), 0);
+            dotsBox.addView(d, p);
+        }
+    }
+
+    // ---------- drawer ----------
+    void openDrawer() {
+        if (busy || screen == 0) return;
+        buildDrawer();
+        drawer.setVisibility(View.VISIBLE);
+        drawerOpen = true;
+        scrim.setAlpha(0f);
+        scrim.animate().alpha(1f).setDuration(200).start();
+        panel.setTranslationX(panelW);
+        panel.animate().translationX(0).setDuration(250).start();
+    }
+
+    void closeDrawer() {
+        if (!drawerOpen) return;
+        drawerOpen = false;
+        scrim.animate().alpha(0f).setDuration(180).start();
+        panel.animate().translationX(panelW).setDuration(220)
+                .withEndAction(() -> drawer.setVisibility(View.GONE)).start();
+    }
+
+    String permText(JSONObject r) {
+        JSONObject p = r.optJSONObject("permissions");
+        if (p == null) return "قراءة";
+        if (p.optBoolean("admin")) return "مدير";
+        if (p.optBoolean("push") || p.optBoolean("maintain")) return "كتابة";
+        return "قراءة فقط";
+    }
+
+    String sourceText(JSONObject r) {
+        JSONObject o = r.optJSONObject("owner");
+        String l = o == null ? "" : o.optString("login");
+        if (l.equals(me)) return "👤 حسابي";
+        if (o != null && "Organization".equals(o.optString("type"))) return "👥 فريق: " + l;
+        return "🤝 مشارك: " + l;
+    }
+
+    void buildDrawer() {
+        panel.removeAllViews();
+        panel.setBackgroundColor(Color.parseColor(BG));
+        panel.setElevation(dp(16));
+        if (!gInit) { openGroups.add(me); gInit = true; }
+        LinearLayout c = vbox();
+        c.setPadding(dp(14), dp(44), dp(14), dp(24));
+
+        LinearLayout hd = new LinearLayout(this);
+        hd.setGravity(Gravity.CENTER_VERTICAL);
+        hd.setPadding(dp(16), dp(16), dp(16), dp(16));
+        hd.setBackground(legend(20));
+        TextView lg = tv("⚡", 30, "#FFFFFF", false);
+        lg.setPaddingRelative(0, 0, dp(12), 0);
+        hd.addView(lg);
+        LinearLayout nm = vbox();
+        nm.addView(tv("Flash Tools", 19, GOLD, true));
+        nm.addView(tv("@" + me, 13, SOFT, false));
+        hd.addView(nm);
+        c.addView(hd);
+
+        TextView tk = tv("🔑 صلاحيات التوكن", 12, GRAY, false);
+        tk.setPadding(dp(6), dp(16), 0, dp(4));
+        c.addView(tk);
+        String sc = scopes == null ? "توكن دقيق (Fine-grained) — الصلاحيات بتختلف من مستودع للتاني"
+                : scopes.isEmpty() ? "بدون نطاقات — وصول للمستودعات العامة فقط" : scopes;
+        TextView st = tv(sc, 13, TXT, false);
+        st.setPadding(dp(16), dp(12), dp(16), dp(12));
+        st.setBackground(rect(CARD, 14));
+        c.addView(st);
+
+        c.addView(gap(14));
+        final Switch sw = new Switch(this);
+        sw.setChecked(dark);
+        sw.setOnCheckedChangeListener((bv, on) -> {
+            prefs.edit().putBoolean("dark", on).apply();
+            applyTheme();
+            drawerOpen = false;
+            drawer.setVisibility(View.GONE);
+            render();
+        });
+        List<View> tr = new ArrayList<>();
+        tr.add(row("🌙", "الوضع الداكن", null, sw, v -> sw.toggle()));
+        c.addView(card(tr));
+
+        TextView rt = tv("📦 المستودعات (" + repos.size() + ")", 12, GRAY, false);
+        rt.setPadding(dp(6), dp(16), 0, dp(4));
+        c.addView(rt);
+        Map<String, List<JSONObject>> g = new LinkedHashMap<>();
+        Map<String, String> types = new LinkedHashMap<>();
+        g.put(me, new ArrayList<>());
+        for (JSONObject r : repos) {
+            JSONObject o = r.optJSONObject("owner");
+            String k = o == null ? "؟" : o.optString("login");
+            if (!g.containsKey(k)) g.put(k, new ArrayList<>());
+            g.get(k).add(r);
+            types.put(k, o == null ? "" : o.optString("type"));
+        }
+        for (Map.Entry<String, List<JSONObject>> en : g.entrySet()) {
+            final String k = en.getKey();
+            if (en.getValue().isEmpty()) continue;
+            boolean open = openGroups.contains(k);
+            String label = k.equals(me) ? "👤 حسابي"
+                    : "Organization".equals(types.get(k)) ? "👥 فريق: " + k : "🤝 مشارك: " + k;
+            List<View> rows = new ArrayList<>();
+            rows.add(row("", label + " (" + en.getValue().size() + ")", null,
+                    tv(open ? "▾" : "▸", 18, GRAY, false), v -> {
+                        if (!openGroups.remove(k)) openGroups.add(k);
+                        buildDrawer();
+                    }));
+            if (open) {
+                for (JSONObject r : en.getValue()) {
+                    final JSONObject rr = r;
+                    boolean isCur = cur != null && cur.optString("full_name").equals(r.optString("full_name"));
+                    rows.add(row(r.optBoolean("private") ? "🔒" : "📘", r.optString("name"),
+                            permText(r) + (isCur ? " • مفتوح الآن" : ""), null, v -> openRepo(rr)));
+                }
+            }
+            c.addView(gap(8));
+            c.addView(card(rows));
+        }
+
+        c.addView(gap(16));
+        List<View> f = new ArrayList<>();
+        f.add(row("🔄", "تحديث المستودعات", null, null, v -> { closeDrawer(); loadAccount(); }));
+        f.add(row("👨‍💻", "المطوّر", "AXEL", null, v -> { }));
+        c.addView(card(f));
+        TextView lo = link("🚪 خروج", RED, v -> logout());
+        lo.setGravity(Gravity.CENTER);
+        c.addView(gap(8));
+        c.addView(lo, lp(-1, -2));
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(c);
+        panel.addView(sv, lp(-1, -1));
+    }
+
+    void openRepo(JSONObject r) {
+        cur = r;
+        repo = r.optString("full_name");
+        branch = r.optString("default_branch", "main");
+        JSONObject p = r.optJSONObject("permissions");
+        canWrite = p != null && (p.optBoolean("push") || p.optBoolean("admin") || p.optBoolean("maintain"));
+        path = "";
+        closeDrawer();
+        showBrowser();
+    }
+
+    // ---------- browser ----------
     void showBrowser() {
         screen = 2;
+        clockT = null;
+        cardView = null;
         items = new ArrayList<>();
         sel.clear();
         renderBrowser();
@@ -370,31 +720,49 @@ public class MainActivity extends Activity {
         return String.format(Locale.US, "%.1f MB", n / 1048576.0);
     }
 
+    boolean isDir(String p) {
+        for (JSONObject o : items) if (o.optString("path").equals(p)) return "dir".equals(o.optString("type"));
+        return false;
+    }
+
     void renderBrowser() {
         List<View> rows = new ArrayList<>();
         for (JSONObject o : items) {
             final String p = o.optString("path");
             final String name = o.optString("name");
-            if ("dir".equals(o.optString("type"))) {
-                rows.add(row("📁", name, null, tv("‹", 24, GRAY, false), v -> {
-                    path = p;
-                    sel.clear();
-                    work("جاري التحميل...", null);
-                }));
-            } else {
-                final TextView ck = tv("", 14, "#FFFFFF", true);
-                ck.setGravity(Gravity.CENTER);
-                ck.setLayoutParams(lp(dp(24), dp(24)));
-                paintCk(ck, sel.contains(p));
-                rows.add(row("📄", name, human(o.optLong("size")), ck, v -> {
-                    boolean now = !sel.contains(p);
-                    if (now) sel.add(p); else sel.remove(p);
-                    paintCk(ck, now);
-                    refreshBar();
-                }));
-            }
+            final boolean dir = "dir".equals(o.optString("type"));
+            final TextView ck = tv("", 14, "#FFFFFF", true);
+            ck.setGravity(Gravity.CENTER);
+            ck.setLayoutParams(new FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER));
+            paintCk(ck, sel.contains(p));
+            final Runnable tg = () -> {
+                boolean now = !sel.contains(p);
+                if (now) sel.add(p); else sel.remove(p);
+                paintCk(ck, now);
+                refreshBar();
+            };
+            FrameLayout cw = new FrameLayout(this);
+            cw.setLayoutParams(lp(dp(44), dp(44)));
+            cw.addView(ck);
+            cw.setOnClickListener(v -> tg.run());
+            LinearLayout tr = new LinearLayout(this);
+            tr.setGravity(Gravity.CENTER_VERTICAL);
+            tr.addView(cw);
+            if (dir) tr.addView(tv("‹", 24, GRAY, false));
+            rows.add(row(dir ? "📁" : "📄", name, dir ? null : human(o.optLong("size")), tr, v -> {
+                if (dir) { path = p; sel.clear(); work("جاري التحميل...", null); }
+                else tg.run();
+            }));
         }
         LinearLayout content = vbox();
+        TextView meta = tv((cur == null ? "" : sourceText(cur) + "  •  " + permText(cur)), 12, GRAY, false);
+        meta.setPadding(dp(6), 0, 0, dp(10));
+        content.addView(meta);
+        if (!canWrite) {
+            TextView ro = tv("🔒 قراءة فقط — توكنك مالوش صلاحية كتابة على المستودع ده", 13, RED, false);
+            ro.setPadding(dp(6), 0, 0, dp(10));
+            content.addView(ro);
+        }
         if (rows.isEmpty()) {
             TextView e = tv("المجلد فاضي", 16, GRAY, false);
             e.setGravity(Gravity.CENTER);
@@ -404,7 +772,7 @@ public class MainActivity extends Activity {
         barBox = new FrameLayout(this);
         barBox.addView(bar());
         String title = path.isEmpty() ? repo.substring(repo.indexOf('/') + 1) : base(path);
-        setScreen(page(title, link("› رجوع", BLUE, v -> goBack()),
+        setScreen(page(title, hrow(menuBtn(), link("› رجوع", BLUE, v -> goBack())),
                 link("↻ تحديث", BLUE, v -> work("جاري التحديث...", null)), content, barBox));
     }
 
@@ -417,7 +785,7 @@ public class MainActivity extends Activity {
         LinearLayout a = vbox();
         a.setGravity(Gravity.CENTER_HORIZONTAL);
         a.setPadding(0, dp(4), 0, dp(4));
-        TextView i = tv(ic, 22, "#000000", false);
+        TextView i = tv(ic, 22, TXT, false);
         i.setGravity(Gravity.CENTER);
         a.addView(i);
         a.addView(tv(lb, 11, col, false));
@@ -428,21 +796,22 @@ public class MainActivity extends Activity {
 
     View bar() {
         int n = sel.size();
+        boolean w = canWrite;
         boolean zip1 = n == 1 && sel.iterator().next().toLowerCase().endsWith(".zip");
         LinearLayout b = new LinearLayout(this);
-        b.setBackgroundColor(Color.WHITE);
+        b.setBackgroundColor(Color.parseColor(CARD));
         b.setPadding(0, dp(6), 0, dp(6));
-        b.addView(act("☁️", "رفع", true, BLUE, v -> upMenu()), new LinearLayout.LayoutParams(0, -2, 1));
-        b.addView(act("📂", "فك ضغط", zip1, BLUE, v -> unzipSel()), new LinearLayout.LayoutParams(0, -2, 1));
-        b.addView(act("🗜️", "ضغط", n > 0, BLUE, v -> zipSel()), new LinearLayout.LayoutParams(0, -2, 1));
+        b.addView(act("☁️", "رفع", w, BLUE, v -> upMenu()), new LinearLayout.LayoutParams(0, -2, 1));
+        b.addView(act("📂", "فك ضغط", zip1 && w, BLUE, v -> unzipSel()), new LinearLayout.LayoutParams(0, -2, 1));
+        b.addView(act("🗜️", "ضغط", n > 0 && w, BLUE, v -> zipSel()), new LinearLayout.LayoutParams(0, -2, 1));
         b.addView(act("⬇️", "تحميل", n > 0, BLUE, v -> downloadSel()), new LinearLayout.LayoutParams(0, -2, 1));
-        b.addView(act("🗑️", "حذف", n > 0, RED, v -> deleteSel()), new LinearLayout.LayoutParams(0, -2, 1));
-        LinearLayout w = vbox();
+        b.addView(act("🗑️", "حذف", n > 0 && w, RED, v -> deleteSel()), new LinearLayout.LayoutParams(0, -2, 1));
+        LinearLayout wr = vbox();
         View d = new View(this);
-        d.setBackgroundColor(0x2F000000);
-        w.addView(d, lp(-1, 1));
-        w.addView(b);
-        return w;
+        d.setBackgroundColor(Color.parseColor(SEP));
+        wr.addView(d, lp(-1, 1));
+        wr.addView(b);
+        return wr;
     }
 
     // ---------- actions ----------
@@ -463,9 +832,7 @@ public class MainActivity extends Activity {
     }
 
     void upMenu() {
-        new AlertDialog.Builder(this)
-                .setItems(new String[]{"رفع ملفات", "رفع ملف zip وفك ضغطه"}, (d, i) -> pick(i == 1))
-                .show();
+        ab().setItems(new String[]{"رفع ملفات", "رفع ملف zip وفك ضغطه"}, (d, i) -> pick(i == 1)).show();
     }
 
     void pick(boolean zip) {
@@ -521,12 +888,12 @@ public class MainActivity extends Activity {
 
     void downloadSel() {
         final List<String> ps = new ArrayList<>(sel);
+        final boolean one = ps.size() == 1 && !isDir(ps.get(0));
+        final String name = one ? base(ps.get(0)) : (ps.size() == 1 ? base(ps.get(0)) : "FlashTools") + ".zip";
         busy("جاري التجهيز...");
         ex.execute(() -> {
             try {
-                final boolean one = ps.size() == 1;
                 final byte[] data = one ? raw(ps.get(0)) : pack(ps);
-                final String name = one ? base(ps.get(0)) : "FlashTools.zip";
                 ui(() -> {
                     idle();
                     pendingSave = data;
@@ -543,18 +910,11 @@ public class MainActivity extends Activity {
     }
 
     void deleteSel() {
-        final Map<String, String> shas = new HashMap<>();
-        for (JSONObject o : items) if (sel.contains(o.optString("path"))) shas.put(o.optString("path"), o.optString("sha"));
-        new AlertDialog.Builder(this)
-                .setTitle("حذف " + shas.size() + " ملف؟")
-                .setMessage("لا يمكن التراجع عن الحذف")
+        final List<String> ps = new ArrayList<>(sel);
+        ab().setTitle("حذف " + ps.size() + " عنصر؟")
+                .setMessage("الملفات والمجلدات (بكل محتواها) هتتحذف نهائيًا")
                 .setNegativeButton("إلغاء", null)
-                .setPositiveButton("حذف", (d, i) -> work("جاري الحذف...", () -> {
-                    for (Map.Entry<String, String> e : shas.entrySet()) {
-                        status("حذف " + base(e.getKey()));
-                        del(e.getKey(), e.getValue());
-                    }
-                }))
+                .setPositiveButton("حذف", (d, i) -> work("جاري الحذف...", () -> deleteMany(ps)))
                 .show();
     }
 
@@ -583,7 +943,9 @@ public class MainActivity extends Activity {
 
     String join(String d, String n) { return d.isEmpty() ? n : d + "/" + n; }
     String base(String p) { return p.substring(p.lastIndexOf('/') + 1); }
+    String rel(String f) { return !path.isEmpty() && f.startsWith(path + "/") ? f.substring(path.length() + 1) : f; }
     String str(byte[] b) { return new String(b, StandardCharsets.UTF_8); }
+    byte[] bytes(JSONObject o) { return o.toString().getBytes(StandardCharsets.UTF_8); }
 
     void extract(byte[] z) throws Exception {
         try (ZipInputStream in = new ZipInputStream(new ByteArrayInputStream(z))) {
@@ -598,13 +960,27 @@ public class MainActivity extends Activity {
         }
     }
 
+    void walk(String p, List<String> out) throws Exception {
+        String s = str(req("GET", cu(p), JSON, null)).trim();
+        if (s.startsWith("[")) {
+            JSONArray a = new JSONArray(s);
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.getJSONObject(i);
+                if ("dir".equals(o.optString("type"))) walk(o.getString("path"), out);
+                else out.add(o.getString("path"));
+            }
+        } else out.add(p);
+    }
+
     byte[] pack(List<String> ps) throws Exception {
+        List<String> fs = new ArrayList<>();
+        for (String p : ps) walk(p, fs);
         ByteArrayOutputStream bo = new ByteArrayOutputStream();
         try (ZipOutputStream z = new ZipOutputStream(bo)) {
-            for (String p : ps) {
-                status("ضغط " + base(p));
-                z.putNextEntry(new ZipEntry(base(p)));
-                z.write(raw(p));
+            for (String f : fs) {
+                status("ضغط " + base(f));
+                z.putNextEntry(new ZipEntry(rel(f)));
+                z.write(raw(f));
                 z.closeEntry();
             }
         }
@@ -622,11 +998,17 @@ public class MainActivity extends Activity {
         return s.toString();
     }
 
-    String cu(String p) { return API + "/repos/" + repo + "/contents/" + ep(p); }
+    String R() { return API + "/repos/" + repo; }
+    String cu(String p) { return R() + "/contents/" + ep(p); }
 
     String msgOf(byte[] r, int code) {
         if (code == 401) return "التوكن غير صحيح أو منتهي";
-        try { return new JSONObject(str(r)).optString("message", "خطأ " + code); } catch (Exception e) { return "خطأ " + code; }
+        if (code == 403) return "مفيش صلاحية لده (403): " + tryMsg(r, "");
+        return tryMsg(r, "خطأ " + code);
+    }
+
+    String tryMsg(byte[] r, String d) {
+        try { return new JSONObject(str(r)).optString("message", d); } catch (Exception e) { return d; }
     }
 
     byte[] req(String m, String url, String accept, byte[] body) throws Exception {
@@ -643,6 +1025,7 @@ public class MainActivity extends Activity {
             try (OutputStream o = c.getOutputStream()) { o.write(body); }
         }
         int code = c.getResponseCode();
+        if (url.equals(API + "/user")) lastScopes = c.getHeaderField("X-OAuth-Scopes");
         InputStream is = code >= 400 ? c.getErrorStream() : c.getInputStream();
         byte[] r = is == null ? new byte[0] : readAll(is);
         c.disconnect();
@@ -681,12 +1064,59 @@ public class MainActivity extends Activity {
         JSONObject body = new JSONObject().put("message", "Flash Tools")
                 .put("content", Base64.encodeToString(b, Base64.NO_WRAP));
         if (sha != null) body.put("sha", sha);
-        req("PUT", cu(p), JSON, body.toString().getBytes(StandardCharsets.UTF_8));
+        req("PUT", cu(p), JSON, bytes(body));
     }
 
     void del(String p, String sha) throws Exception {
-        JSONObject body = new JSONObject().put("message", "Flash Tools").put("sha", sha);
-        req("DELETE", cu(p), JSON, body.toString().getBytes(StandardCharsets.UTF_8));
+        req("DELETE", cu(p), JSON, bytes(new JSONObject().put("message", "Flash Tools").put("sha", sha)));
+    }
+
+    // حذف ملفات ومجلدات: commit واحد عبر Git Data API، ولو فشل بيحذف واحد واحد
+    void deleteMany(List<String> ps) throws Exception {
+        try {
+            status("جاري الحذف (commit واحد)...");
+            treeDelete(ps);
+        } catch (Exception e) {
+            for (String p : ps) { status("حذف " + base(p)); delRec(p); }
+        }
+    }
+
+    void treeDelete(List<String> ps) throws Exception {
+        JSONObject ref = new JSONObject(str(req("GET", R() + "/git/ref/heads/" + branch, JSON, null)));
+        String cs = ref.getJSONObject("object").getString("sha");
+        String ts = new JSONObject(str(req("GET", R() + "/git/commits/" + cs, JSON, null)))
+                .getJSONObject("tree").getString("sha");
+        JSONObject tr = new JSONObject(str(req("GET", R() + "/git/trees/" + ts + "?recursive=1", JSON, null)));
+        if (tr.optBoolean("truncated")) throw new Exception("tree truncated");
+        JSONArray ents = tr.getJSONArray("tree");
+        JSONArray dl = new JSONArray();
+        for (int i = 0; i < ents.length(); i++) {
+            JSONObject o = ents.getJSONObject(i);
+            if (!"blob".equals(o.optString("type"))) continue;
+            String fp = o.getString("path");
+            for (String d : ps) {
+                if (fp.equals(d) || fp.startsWith(d + "/")) {
+                    dl.put(new JSONObject().put("path", fp).put("mode", o.optString("mode", "100644"))
+                            .put("type", "blob").put("sha", JSONObject.NULL));
+                    break;
+                }
+            }
+        }
+        if (dl.length() == 0) throw new Exception("nothing");
+        JSONObject nt = new JSONObject(str(req("POST", R() + "/git/trees", JSON,
+                bytes(new JSONObject().put("base_tree", ts).put("tree", dl)))));
+        JSONObject cm = new JSONObject(str(req("POST", R() + "/git/commits", JSON,
+                bytes(new JSONObject().put("message", "Flash Tools: delete").put("tree", nt.getString("sha"))
+                        .put("parents", new JSONArray().put(cs))))));
+        req("PATCH", R() + "/git/refs/heads/" + branch, JSON, bytes(new JSONObject().put("sha", cm.getString("sha"))));
+    }
+
+    void delRec(String p) throws Exception {
+        String s = str(req("GET", cu(p), JSON, null)).trim();
+        if (s.startsWith("[")) {
+            JSONArray a = new JSONArray(s);
+            for (int i = 0; i < a.length(); i++) delRec(a.getJSONObject(i).getString("path"));
+        } else del(p, new JSONObject(s).getString("sha"));
     }
 
     // ---------- encrypted token (Android Keystore, AES-GCM) ----------
