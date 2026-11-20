@@ -1,0 +1,35 @@
+name: Unzip upload
+
+on:
+  push:
+    paths:
+      - 'upload.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unzip
+        run: |
+          unzip -o upload.zip -x ".github/*" "__MACOSX/*"
+          rm upload.zip
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -m "Unzip upload" || echo "nothing to commit"
+          git push
+
+      - name: Trigger build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml
